@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LIBGL_ALWAYS_SOFTWARE=1 \
     DONT_PROMPT_WSL_INSTALL=1
 
-# 1. Install Xorg server, X11 utilities, full XFCE desktop components, and XRDP
+# 1. Install base Xorg, complete XFCE desktop, XRDP, and D-Bus tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xserver-xorg-core \
     xorgxrdp \
@@ -18,13 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-xkb-utils \
     xauth \
     xinit \
-    xfwm4 \
-    xfce4-session \
-    xfce4-panel \
+    xfce4 \
     xfce4-terminal \
-    xfce4-settings \
-    xfdesktop4 \
-    thunar \
     dbus-x11 \
     sudo \
     procps \
@@ -49,7 +44,7 @@ RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
     && locale-gen en_US.UTF-8 \
     && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
-# 3. Allow anybody to start Xorg server (fixes root/non-console Xorg permission crashes)
+# 3. Allow anybody to start Xorg server
 RUN mkdir -p /etc/X11 \
     && echo "allowed_users=anybody" > /etc/X11/Xwrapper.config \
     && echo "needs_root_rights=yes" >> /etc/X11/Xwrapper.config
@@ -60,7 +55,7 @@ RUN mkdir -p /run/dbus /var/run/xrdp /tmp/.X11-unix /etc/xrdp \
     && chmod 1777 /tmp/.X11-unix \
     && adduser xrdp ssl-cert 2>/dev/null || true
 
-# 5. XRDP & sesman configuration for seamless root login and high compatibility
+# 5. XRDP & sesman configuration
 RUN sed -i 's/^[[:space:]]*AllowRootLogin=.*/AllowRootLogin=true/' /etc/xrdp/sesman.ini \
     && sed -i 's/^[[:space:]]*KillDisconnected=.*/KillDisconnected=true/' /etc/xrdp/sesman.ini \
     && sed -i 's/^[[:space:]]*FuseMountName=.*/FuseMountName=thinclient_drives/' /etc/xrdp/sesman.ini \
@@ -68,13 +63,13 @@ RUN sed -i 's/^[[:space:]]*AllowRootLogin=.*/AllowRootLogin=true/' /etc/xrdp/ses
               -e '/^[[:space:]]*crypt_level[[:space:]]*=/d' /etc/xrdp/xrdp.ini \
     && sed -i '/^\[Globals\]/a port=3389\ncrypt_level=low' /etc/xrdp/xrdp.ini
 
-# Disable pam_systemd and pam_loginuid in xrdp-sesman pam if present to prevent container session hang
+# Prevent container PAM login hangs
 RUN if [ -f /etc/pam.d/xrdp-sesman ]; then \
         sed -i '/pam_systemd.so/d' /etc/pam.d/xrdp-sesman; \
         sed -i '/pam_loginuid.so/d' /etc/pam.d/xrdp-sesman; \
     fi
 
-# 6. Disable compositor & animations in XFCE for low CPU / instant rendering
+# 6. Disable compositor for smoother remote rendering
 RUN cat <<'EOF' > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfwm4" version="1.0">
@@ -86,33 +81,37 @@ RUN cat <<'EOF' > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 </channel>
 EOF
 
-# 7. Create root default .xsession and /etc/skel/.xsession
-RUN echo "startxfce4" > /root/.xsession \
-    && echo "startxfce4" > /root/.Xclients \
+# 7. Create root default .xsession with dbus wrapper
+RUN echo "exec dbus-run-session -- xfce4-session" > /root/.xsession \
     && chmod +x /root/.xsession
 
-# 8. StartWM script with clean environment variables
+# 8. StartWM script with XDG_RUNTIME_DIR and dbus session wrapper
 RUN cat <<'EOF' > /etc/xrdp/startwm.sh
 #!/bin/sh
-unset DBUS_SESSION_BUS_ADDRESS
-unset SESSION_MANAGER
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export HOME=/root
+export USER=root
+
+# Set up runtime directory for root
+export XDG_RUNTIME_DIR=/tmp/runtime-root
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=XFCE
 export XDG_SESSION_DESKTOP=xfce
 export DESKTOP_SESSION=xfce
 export XDG_CONFIG_DIRS=/etc/xdg
-export HOME=/root
-export USER=root
+
+unset DBUS_SESSION_BUS_ADDRESS
+unset SESSION_MANAGER
 
 if [ -r /etc/profile ]; then
     . /etc/profile
 fi
 
-if [ -f /root/.xsession ]; then
-    exec /bin/sh /root/.xsession
-else
-    exec /usr/bin/startxfce4
-fi
+exec dbus-run-session -- xfce4-session
 EOF
 RUN chmod +x /etc/xrdp/startwm.sh
 
@@ -121,18 +120,17 @@ RUN cat <<'EOF' > /entrypoint.sh
 #!/bin/sh
 set -e
 
-# Update root password dynamically (default: root)
 PASS="${ROOT_PASSWORD:-root}"
 echo "root:${PASS}" | chpasswd
 
-# Respect dynamic PORT environment variable (standard on Railway, Render, etc.)
 RDP_PORT="${PORT:-3389}"
 sed -i -E "s/^[[:space:]]*port=[0-9]+/port=${RDP_PORT}/g" /etc/xrdp/xrdp.ini
 
-# Clean stale sockets and lock files
-rm -rf /var/run/xrdp/* /tmp/.X11-unix/* /tmp/.X* /run/xrdp.pid /run/xrdp-sesman.pid /run/dbus/pid 2>/dev/null || true
-mkdir -p /run/dbus /var/run/xrdp /tmp/.X11-unix /etc/xrdp /var/log
+# Clean stale sockets, locks, and temporary runtimes
+rm -rf /var/run/xrdp/* /tmp/.X11-unix/* /tmp/.X* /run/xrdp.pid /run/xrdp-sesman.pid /run/dbus/pid /tmp/runtime-root 2>/dev/null || true
+mkdir -p /run/dbus /var/run/xrdp /tmp/.X11-unix /etc/xrdp /var/log /tmp/runtime-root
 chmod 1777 /tmp/.X11-unix
+chmod 700 /tmp/runtime-root
 
 # Generate TLS certificates if missing
 if [ ! -s /etc/xrdp/cert.pem ] || [ ! -s /etc/xrdp/key.pem ]; then
@@ -165,7 +163,6 @@ echo " Listening on Port: ${RDP_PORT}"
 echo " Default Username : root"
 echo "=========================================================="
 
-# Start XRDP in foreground
 exec /usr/sbin/xrdp -nodaemon
 EOF
 RUN chmod +x /entrypoint.sh
