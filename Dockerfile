@@ -4,78 +4,123 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     PORT=3389 \
-    ROOT_PASSWORD=root \
-    LIBGL_ALWAYS_SOFTWARE=1 \
-    DONT_PROMPT_WSL_INSTALL=1
+    ROOT_PASSWORD=root
 
-# 1. Install TigerVNC server, Xorg backend, full XFCE, Polkit, D-Bus, and network tools
+# ── 1. Packages ───────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xrdp \
     tigervnc-standalone-server \
     tigervnc-common \
-    xserver-xorg-core \
-    xorgxrdp \
-    x11-xserver-utils \
-    x11-utils \
-    xauth \
-    xinit \
     xfce4 \
     xfce4-terminal \
     dbus \
     dbus-x11 \
     policykit-1 \
     sudo \
-    procps \
-    net-tools \
-    iputils-ping \
     openssl \
-    fonts-dejavu-core \
     locales \
     ca-certificates \
     curl \
     wget \
     nano \
+    procps \
+    net-tools \
     python3 \
-    python3-pip \
+    fonts-dejavu-core \
     firefox-esr \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# 2. Configure locale
+# ── 2. Locale ─────────────────────────────────────────────────────────────────
 RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
     && locale-gen en_US.UTF-8 \
-    && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+    && update-locale LANG=en_US.UTF-8
 
-# 3. Create default non-root user (debian:debian) with passwordless sudo
-RUN useradd -m -s /bin/bash -u 1000 debian \
-    && echo "debian:debian" | chpasswd \
-    && usermod -aG sudo debian \
-    && echo "debian ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+# ── 3. XRDP config — written fresh, no sed on existing files ─────────────────
+RUN adduser xrdp ssl-cert 2>/dev/null || true
 
-# 4. Xwrapper config for root & non-root Xorg execution
-RUN mkdir -p /etc/X11 \
-    && echo "allowed_users=anybody" > /etc/X11/Xwrapper.config \
-    && echo "needs_root_rights=yes" >> /etc/X11/Xwrapper.config
+RUN cat > /etc/xrdp/xrdp.ini << 'XRDPINI'
+[Globals]
+ini_version=1
+fork=yes
+port=3389
+tcp_send_buffer_bytes=32768
+authentication_info_required=yes
+use_vsock=false
+security_layer=rdp
+crypt_level=low
+certificate=
+key_file=
+channel_code=1
+max_bpp=32
+xserverbpp=16
+new_cursors=yes
+use_fastpath=both
+use_compression=yes
 
-# 5. XRDP & sesman configuration (Supports root login, security_layer=rdp, and Xvnc/Xorg)
-RUN sed -i 's/^[[:space:]]*AllowRootLogin=.*/AllowRootLogin=true/' /etc/xrdp/sesman.ini \
-    && sed -i 's/^[[:space:]]*KillDisconnected=.*/KillDisconnected=true/' /etc/xrdp/sesman.ini \
-    && sed -i 's/^[[:space:]]*FuseMountName=.*/FuseMountName=thinclient_drives/' /etc/xrdp/sesman.ini \
-    && sed -i -e '/^[[:space:]]*port[[:space:]]*=/d' \
-              -e '/^[[:space:]]*crypt_level[[:space:]]*=/d' \
-              -e '/^[[:space:]]*security_layer[[:space:]]*=/d' /etc/xrdp/xrdp.ini \
-    && sed -i '/^\[Globals\]/a port=3389\ncrypt_level=low\nsecurity_layer=rdp' /etc/xrdp/xrdp.ini \
-    && adduser xrdp ssl-cert 2>/dev/null || true
+[Xvnc]
+name=Xvnc
+lib=libvnc.so
+username=ask
+password=ask
+ip=127.0.0.1
+port=-1
+XRDPINI
 
-# Disable PAM systemd modules inside container to prevent login session stalls
+RUN cat > /etc/xrdp/sesman.ini << 'SESINI'
+[Globals]
+ListenAddress=127.0.0.1
+ListenPort=3350
+EnableUserWindowManager=1
+UserWindowManager=startwm.sh
+DefaultWindowManager=startwm.sh
+[Security]
+AllowRootLogin=true
+MaxLoginRetry=4
+TerminalServerUsers=tsusers
+TerminalServerAdmins=tsadmins
+[Sessions]
+MaxSessions=50
+KillDisconnected=false
+IdleTimeLimit=0
+DisconnectedTimeLimit=0
+[Logging]
+LogFile=/var/log/xrdp-sesman.log
+LogLevel=INFO
+EnableSyslog=false
+[X11DisplayOffset]
+X11DisplayOffset=10
+MaxDisplays=50
+SESINI
+
+# ── 4. PAM — remove systemd/loginuid modules that crash in containers ─────────
 RUN if [ -f /etc/pam.d/xrdp-sesman ]; then \
-        sed -i '/pam_systemd.so/d' /etc/pam.d/xrdp-sesman; \
-        sed -i '/pam_loginuid.so/d' /etc/pam.d/xrdp-sesman; \
+      grep -v 'pam_systemd\|pam_loginuid' /etc/pam.d/xrdp-sesman > /tmp/p \
+      && mv /tmp/p /etc/pam.d/xrdp-sesman; \
     fi
 
-# 6. Disable window compositor in XFCE for instant software rendering & low CPU usage
-RUN mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml
-RUN cat <<'EOF' > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+# ── 5. Session launcher ───────────────────────────────────────────────────────
+RUN cat > /etc/xrdp/startwm.sh << 'STARTWM'
+#!/bin/sh
+if [ -z "$USER" ]; then USER="$(id -un)"; fi
+if [ -z "$HOME" ]; then HOME="$(getent passwd "$USER" | cut -d: -f6)"; fi
+export USER HOME
+export XDG_RUNTIME_DIR="/tmp/run-${USER}"
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=XFCE
+export DESKTOP_SESSION=xfce
+export XDG_CONFIG_DIRS=/etc/xdg
+unset DBUS_SESSION_BUS_ADDRESS SESSION_MANAGER
+exec dbus-run-session -- xfce4-session
+STARTWM
+RUN chmod +x /etc/xrdp/startwm.sh
+
+# ── 6. XFCE: disable compositor ──────────────────────────────────────────────
+RUN mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml \
+             /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml
+
+RUN cat > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml << 'XFWM'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfwm4" version="1.0">
   <property name="general" type="empty">
@@ -84,115 +129,55 @@ RUN cat <<'EOF' > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
     <property name="box_move" type="bool" value="true"/>
   </property>
 </channel>
-EOF
-RUN cp /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml \
-    && mkdir -p /home/debian/.config/xfce4/xfconf/xfce-perchannel-xml \
-    && cp /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml /home/debian/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml \
-    && chown -R debian:debian /home/debian/.config
+XFWM
 
-# 7. Create default .xsession and .Xauthority
-RUN echo "exec dbus-run-session -- xfce4-session" > /etc/skel/.xsession \
-    && cp /etc/skel/.xsession /home/debian/.xsession \
-    && chown debian:debian /home/debian/.xsession \
-    && chmod +x /home/debian/.xsession \
-    && cp /etc/skel/.xsession /root/.xsession \
-    && chmod +x /root/.xsession \
-    && touch /root/.Xauthority /home/debian/.Xauthority \
-    && chown debian:debian /home/debian/.Xauthority
+RUN cp /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml \
+       /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
 
-# 8. StartWM launcher script
-RUN cat <<'EOF' > /etc/xrdp/startwm.sh
-#!/bin/sh
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-
-if [ -z "$USER" ]; then
-    export USER="$(id -un)"
-fi
-if [ -z "$HOME" ]; then
-    export HOME="$(getent passwd "$USER" | cut -d: -f6)"
-fi
-
-export XDG_RUNTIME_DIR="/tmp/runtime-${USER}"
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
-
-export XDG_SESSION_TYPE=x11
-export XDG_CURRENT_DESKTOP=XFCE
-export XDG_SESSION_DESKTOP=xfce
-export DESKTOP_SESSION=xfce
-export XDG_CONFIG_DIRS=/etc/xdg
-
-unset DBUS_SESSION_BUS_ADDRESS
-unset SESSION_MANAGER
-
-if [ -r /etc/profile ]; then
-    . /etc/profile
-fi
-
-if [ -f "$HOME/.xsession" ]; then
-    exec /bin/sh "$HOME/.xsession"
-else
-    exec dbus-run-session -- xfce4-session
-fi
-EOF
-RUN chmod +x /etc/xrdp/startwm.sh
-
-# 9. Clean, robust start entrypoint
-RUN cat <<'EOF' > /entrypoint.sh
+# ── 7. Entrypoint ─────────────────────────────────────────────────────────────
+RUN cat > /entrypoint.sh << 'ENTRY'
 #!/bin/sh
 set -e
 
-# Update credentials dynamically
-PASS="${ROOT_PASSWORD:-root}"
-echo "root:${PASS}" | chpasswd
+echo "root:${ROOT_PASSWORD:-root}" | chpasswd
 
 RDP_PORT="${PORT:-3389}"
-sed -i -E "s/^[[:space:]]*port=[0-9]+/port=${RDP_PORT}/g" /etc/xrdp/xrdp.ini
+python3 -c "
+import re
+path='/etc/xrdp/xrdp.ini'
+txt=open(path).read()
+txt=re.sub(r'^port\s*=\s*\S+','port=$RDP_PORT',txt,flags=re.MULTILINE)
+open(path,'w').write(txt)
+"
 
-# Reset sockets, stale locks, and temporary runtimes
-rm -rf /var/run/xrdp/* /tmp/.X11-unix/* /tmp/.X* /run/xrdp.pid /run/xrdp-sesman.pid /run/dbus/pid /tmp/runtime-* 2>/dev/null || true
-mkdir -p /run/dbus /var/run/dbus /var/run/xrdp /tmp/.X11-unix /etc/xrdp /var/log
+rm -rf /var/run/xrdp /tmp/.X11-unix /tmp/.X* /tmp/run-* /run/dbus/pid 2>/dev/null || true
+mkdir -p /run/dbus /var/run/dbus /var/run/xrdp /tmp/.X11-unix /var/log
 chmod 1777 /tmp/.X11-unix
 
-# Generate TLS certificates if missing
-if [ ! -s /etc/xrdp/cert.pem ] || [ ! -s /etc/xrdp/key.pem ]; then
+if [ ! -s /etc/xrdp/cert.pem ]; then
     openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout /etc/xrdp/key.pem \
-        -out /etc/xrdp/cert.pem \
-        -days 3650 \
-        -subj "/CN=debian-xrdp" 2>/dev/null || true
-    chmod 600 /etc/xrdp/key.pem
-    chmod 644 /etc/xrdp/cert.pem
+        -keyout /etc/xrdp/key.pem -out /etc/xrdp/cert.pem \
+        -days 3650 -subj "/CN=rdp" 2>/dev/null
+    chmod 600 /etc/xrdp/key.pem && chmod 644 /etc/xrdp/cert.pem
     chown root:xrdp /etc/xrdp/key.pem /etc/xrdp/cert.pem 2>/dev/null || true
 fi
 
-# D-Bus Machine ID
-if [ ! -f /etc/machine-id ] || [ ! -s /etc/machine-id ]; then
-    dbus-uuidgen --ensure=/etc/machine-id
-fi
+dbus-uuidgen --ensure=/etc/machine-id
 mkdir -p /var/lib/dbus
 ln -sf /etc/machine-id /var/lib/dbus/machine-id
-
-# Start D-Bus system daemon
 dbus-daemon --system --fork 2>/dev/null || true
 
-# Start XRDP session manager
-/usr/sbin/xrdp-sesman
+/usr/sbin/xrdp-sesman &
+sleep 1
 
-echo "=========================================================="
-echo " 🚀 Debian XRDP Desktop is Ready!"
-echo " Listening on Port : ${RDP_PORT}"
-echo " Root User         : root (Password: ${PASS})"
-echo " Standard User     : debian (Password: debian)"
-echo " Supported Backends: Xorg & Xvnc (TigerVNC)"
-echo "=========================================================="
+echo "===================================="
+echo "  XRDP ready  port=${RDP_PORT}"
+echo "  Login: root / ${ROOT_PASSWORD:-root}"
+echo "===================================="
 
-# Start XRDP in foreground
-exec /usr/sbin/xrdp -nodaemon
-EOF
+exec /usr/sbin/xrdp --nodaemon
+ENTRY
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 3389
-
 CMD ["/entrypoint.sh"]
